@@ -507,7 +507,8 @@ def watch_bobber() -> bool:
             bub_img = _grab_rgb(sct, BUBBLE_REGION)
             brt = _brightness(bub_img)
             g_min, b_min, cyan_excess, net_min = _get_bubble_params(brt)
-            bub_count, bbox = _bubble_stats(bub_img, brt)
+            bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
+            _, bbox = _bubble_stats(bub_img, brt)
             ov("bubble_bbox", bbox)
 
             # v5: Rolling background — update EMA only when we're NOT in a
@@ -566,7 +567,8 @@ def watch_bobber() -> bool:
             bub_img = _grab_rgb(sct, BUBBLE_REGION)
             brt = _brightness(bub_img)
             g_min, b_min, cyan_excess, _ = _get_bubble_params(brt)
-            bub_count, bbox = _bubble_stats(bub_img, brt)
+            bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
+            _, bbox = _bubble_stats(bub_img, brt)
             ov("bubble_bbox", bbox)
             net_count = max(0, bub_count - int(bg_count_ema))
             red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION), brt)
