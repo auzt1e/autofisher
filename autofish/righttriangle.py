@@ -60,25 +60,33 @@ CATCH_REGION       = {"left": 1050, "top": 275,  "width": 400, "height": 30}
 BUBBLE_REGION      = {"left": 650,  "top": 300,  "width": 440, "height": 360}
 WATER_CURSOR_POS   = (870, 470)
 
-# ── Red bobber pixels ─────────────────────────────────────────────────────────
-BOBBER_RED_R_MIN   = 180
-BOBBER_RED_G_MAX   = 80
-BOBBER_RED_B_MAX   = 60
+# ── Red bobber pixels — brightness-interpolated thresholds ───────────────────
+# Each tuple is (brightness, r_min, g_max, b_max).
+# Values between anchors are linearly interpolated from the live scene brightness.
+#   bright scene : R>180, G<80,  B<60   (vivid red against bright water/sky)
+#   dark scene   : R>70,  G<150, B<140  (dim red; background is dark too)
+_BOBBER_BRT_ANCHORS  = (  0, 100, 255)
+_BOBBER_RMIN_ANCHORS = ( 70, 130, 180)
+_BOBBER_GMAX_ANCHORS = (150, 120,  80)
+_BOBBER_BMAX_ANCHORS = (140, 110,  60)
 
-# ── Bubble detection ──────────────────────────────────────────────────────────
-BUBBLE_G_MIN          = 75
-BUBBLE_B_MIN          = 95
-BUBBLE_CYAN_EXCESS    = 30
-BUBBLE_DAY_G_MIN      = 135
-BUBBLE_DAY_B_MIN      = 150
-BUBBLE_DAY_CYAN_EXCESS= 75
-BUBBLE_NIGHT_G_MIN    = 45
-BUBBLE_NIGHT_B_MIN    = 55
-BUBBLE_NIGHT_CYAN_EXCESS = 15
+# ── Bubble detection — brightness-interpolated thresholds ─────────────────────
+# Each tuple is a brightness anchor followed by the corresponding parameter.
+# Parameters are linearly interpolated from the live scene brightness so the
+# bot adjusts smoothly as the in-game time of day changes.
+#   deep night (0–50) : very relaxed — bubbles are barely visible
+#   night (65)        : relaxed
+#   dusk (65)         : balanced
+#   day (110–255)     : strict — avoid false positives in bright, noisy water
+_BUBBLE_BRT_ANCHORS  = (  0,  50,  65, 110, 255)
+_BUBBLE_GMIN_ANCHORS = ( 15,  20,  75, 135, 135)
+_BUBBLE_BMIN_ANCHORS = ( 18,  25,  95, 150, 150)
+_BUBBLE_EXCS_ANCHORS = (  3,   5,  30,  75,  75)
+_BUBBLE_NMIN_ANCHORS = ( 30,  50, 200, 200, 200)  # net-pixel minimum to confirm bubbles
+
 BUBBLE_GONE_THRESH    = 0.15
 BUBBLE_CONFIRM_SECS   = 0.55
 BUBBLE_MIN_BASELINE   = 2
-BUBBLE_NET_MIN        = 200   # minimum *net* pixels above background to count as bubbles
 BUBBLE_PHASE1_REQUIRED = 12   # consecutive above-net-min frames required to confirm
 
 # ── Skill check ───────────────────────────────────────────────────────────────
@@ -241,33 +249,34 @@ def _brightness(img: Image.Image) -> float:
     return ImageStat.Stat(img.convert("L")).mean[0]
 
 
-def _get_bubble_thresholds(brightness: float):
-    """Return bubble thresholds based on scene brightness (day/dusk-night/deep-night)."""
-    if brightness >= 110:
-        return BUBBLE_DAY_G_MIN, BUBBLE_DAY_B_MIN, BUBBLE_DAY_CYAN_EXCESS
-    if brightness >= 65:
-        return BUBBLE_G_MIN, BUBBLE_B_MIN, BUBBLE_CYAN_EXCESS
-    return BUBBLE_NIGHT_G_MIN, BUBBLE_NIGHT_B_MIN, BUBBLE_NIGHT_CYAN_EXCESS
+def _get_bubble_params(brightness: float):
+    """Return (g_min, b_min, cyan_excess, net_min) interpolated from scene brightness."""
+    brt = float(brightness)
+    g_min       = int(np.interp(brt, _BUBBLE_BRT_ANCHORS, _BUBBLE_GMIN_ANCHORS))
+    b_min       = int(np.interp(brt, _BUBBLE_BRT_ANCHORS, _BUBBLE_BMIN_ANCHORS))
+    cyan_excess = int(np.interp(brt, _BUBBLE_BRT_ANCHORS, _BUBBLE_EXCS_ANCHORS))
+    net_min     = int(np.interp(brt, _BUBBLE_BRT_ANCHORS, _BUBBLE_NMIN_ANCHORS))
+    return g_min, b_min, cyan_excess, net_min
 
 
-def _count_bobber_pixels(img: Image.Image) -> int:
+def _get_bobber_thresholds(brightness: float):
+    """Return (r_min, g_max, b_max) for bobber detection, interpolated from brightness."""
+    brt = float(brightness)
+    r_min = int(np.interp(brt, _BOBBER_BRT_ANCHORS, _BOBBER_RMIN_ANCHORS))
+    g_max = int(np.interp(brt, _BOBBER_BRT_ANCHORS, _BOBBER_GMAX_ANCHORS))
+    b_max = int(np.interp(brt, _BOBBER_BRT_ANCHORS, _BOBBER_BMAX_ANCHORS))
+    return r_min, g_max, b_max
+
+
+def _count_bobber_pixels(img: Image.Image, brightness: float) -> int:
     w, h = img.size
     if w > 8 and h > 8:
         img = img.crop((4, 4, w - 4, h - 4))
     arr = np.array(img, dtype=np.int32)
     R, G, B = arr[:,:,0], arr[:,:,1], arr[:,:,2]
 
-    avg_brightness = float(np.mean(arr))
-    if avg_brightness < 100:
-        red_min = max(120, BOBBER_RED_R_MIN - 50)
-        green_max = min(120, BOBBER_RED_G_MAX + 40)
-        blue_max = min(110, BOBBER_RED_B_MAX + 50)
-    else:
-        red_min = BOBBER_RED_R_MIN
-        green_max = BOBBER_RED_G_MAX
-        blue_max = BOBBER_RED_B_MAX
-
-    return int(np.sum((R > red_min) & (G < green_max) & (B < blue_max)))
+    r_min, g_max, b_max = _get_bobber_thresholds(brightness)
+    return int(np.sum((R > r_min) & (G < g_max) & (B < b_max)))
 
 
 def _count_bubble_pixels(img: Image.Image,
@@ -284,8 +293,9 @@ def _count_bubble_pixels(img: Image.Image,
 
     Rain rejection: scaled by brightness.
       - Day/dusk (brightness >= 65): require R*2 < G and R*2 < B.
-      - Night (65 > brightness >= 35): use relaxed R*3 < G*2 and R*3 < B*2.
-      - Deep night (brightness < 35): skip rain rejection (rain invisible).
+      - Night (65 > brightness >= 50): use relaxed R*3 < G*2 and R*3 < B*2.
+      - Deep night (brightness < 50): skip rain rejection (rain invisible and
+        bubbles too dim to survive any ratio filter).
     """
     w, h = img.size
     if w > 8 and h > 8:
@@ -295,7 +305,7 @@ def _count_bubble_pixels(img: Image.Image,
     cyan_excess = G + B - 2 * R
     if brightness >= 65:
         rain_mask = (R * 2 < G) & (R * 2 < B)
-    elif brightness >= 35:
+    elif brightness >= 50:
         rain_mask = (R * 3 < G * 2) & (R * 3 < B * 2)
     else:
         rain_mask = np.ones(R.shape, dtype=bool)
@@ -328,15 +338,15 @@ def watch_bobber() -> bool:
     # ── Phase 1: wait for bubbles ─────────────────────────────────────────────
     ov("bobber_state", "waiting for bubbles")
     with mss.mss() as sct:
-        img = _grab_rgb(sct, BUBBLE_REGION)
-        brt = _brightness(img)
-        g_min, b_min, cyan_excess = _get_bubble_thresholds(brt)
+        bg_img = _grab_rgb(sct, BUBBLE_REGION)
+        brt = _brightness(bg_img)
+        g_min, b_min, cyan_excess, net_min = _get_bubble_params(brt)
         # Measure ambient background count before any bubbles could appear.
-        # All subsequent checks use *net* count (above background) so that
-        # normal night-water pixels (~317 at brightness≈44) never register as
-        # bubbles, regardless of the absolute threshold values.
-        bg_count  = _count_bubble_pixels(img, g_min, b_min, cyan_excess, brt)
-        log(f"  🫧 Phase 1: waiting for bubbles (brightness={brt:.1f} bg={bg_count})")
+        # bg_img is held in memory so bg_count can be recomputed with the
+        # current (brightness-interpolated) thresholds on every frame, keeping
+        # the net count consistent as lighting changes throughout the session.
+        bg_count = _count_bubble_pixels(bg_img, g_min, b_min, cyan_excess, brt)
+        log(f"  🫧 Phase 1: waiting for bubbles (brightness={brt:.1f} g_min={g_min} b_min={b_min} excess={cyan_excess} net_min={net_min} bg={bg_count})")
 
         consecutive = 0
         history     = []   # stores *net* counts
@@ -344,23 +354,21 @@ def watch_bobber() -> bool:
         while time.time() < deadline:
             if not fishing_active:
                 return False
-            bub_img   = _grab_rgb(sct, BUBBLE_REGION)
-            if frame_n % 60 == 0 and frame_n > 0:
-                brt = _brightness(bub_img)
-                g_min, b_min, cyan_excess = _get_bubble_thresholds(brt)
-                if DEBUG_VERBOSE:
-                    log(f"  🫧 Phase1 thresholds updated: brightness={brt:.1f}")
+            bub_img = _grab_rgb(sct, BUBBLE_REGION)
+            brt = _brightness(bub_img)
+            g_min, b_min, cyan_excess, net_min = _get_bubble_params(brt)
+            bg_count  = _count_bubble_pixels(bg_img, g_min, b_min, cyan_excess, brt)
             bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
             net_count = max(0, bub_count - bg_count)
-            red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION))
+            red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION), brt)
             frame_n  += 1
             ov("bubble_count", net_count)
             ov("bobber_count", red_count)
 
             if DEBUG_VERBOSE or frame_n % 30 == 0:
-                log(f"  🫧 Phase1: net={net_count} red={red_count} streak={consecutive}/{BUBBLE_PHASE1_REQUIRED}")
+                log(f"  🫧 Phase1 brt={brt:.1f} net={net_count} red={red_count} streak={consecutive}/{BUBBLE_PHASE1_REQUIRED}")
 
-            if net_count >= BUBBLE_NET_MIN:
+            if net_count >= net_min:
                 consecutive += 1
                 history.append(net_count)
             else:
@@ -388,15 +396,13 @@ def watch_bobber() -> bool:
         while time.time() < deadline:
             if not fishing_active:
                 return False
-            bub_img   = _grab_rgb(sct, BUBBLE_REGION)
-            if frame_n % 60 == 0:
-                brt = _brightness(bub_img)
-                g_min, b_min, cyan_excess = _get_bubble_thresholds(brt)
-                if DEBUG_VERBOSE:
-                    log(f"  🫧 Phase2 thresholds updated: brightness={brt:.1f}")
+            bub_img = _grab_rgb(sct, BUBBLE_REGION)
+            brt = _brightness(bub_img)
+            g_min, b_min, cyan_excess, _ = _get_bubble_params(brt)
+            bg_count  = _count_bubble_pixels(bg_img, g_min, b_min, cyan_excess, brt)
             bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
             net_count = max(0, bub_count - bg_count)
-            red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION))
+            red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION), brt)
             frame_n  += 1
             ov("bubble_count", net_count)
             ov("bobber_count", red_count)
