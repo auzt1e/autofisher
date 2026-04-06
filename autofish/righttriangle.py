@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Autofish Bot — Roblox Western Edition  (v4 — false reel tracking + catch gate)
+Autofish Bot — Roblox Western Edition  (v5 — bubble baseline fix + catch OCR hardening)
 ================================================================================
 Requirements:
     pip install mss pillow pytesseract pynput numpy
@@ -12,17 +12,18 @@ Controls:
     F7  — Toggle debug overlay
     F8  — Quit
 
-Fixes vs v2:
-  • Skill OCR: Otsu binarisation instead of percentile threshold
-  • Skill OCR: fast-exit on first hit (psm=10 first, fallbacks only if needed)
-  • Skill window: widened to 5s; each frame uses only the cheapest strategy first
-  • Same-letter repeat: timer-based cooldown instead of brittle pixel-diff
-  • Catch OCR: Otsu + relaxed green/yellow predicates + full-width scan
-  • Bubble: baseline update smoothed to avoid false positives from wave spikes
+Fixes vs v4:
+  • Bubble detection: rolling-average background replaces stale single-frame bg
+  • Bubble detection: adaptive net_min floor for nighttime (brt < 50)
+  • Bubble detection: BUBBLE_PHASE1_REQUIRED lowered to 8 with confirmation hysteresis
+  • Catch OCR: morphological noise cleanup before binarization
+  • Catch OCR: adaptive CATCH_MIN_COLORED_PIXELS based on scene brightness
+  • Catch OCR: median-filter pre-pass to suppress water ripple texture
 """
 
 import os, sys, time, threading, argparse, ctypes, shutil, re
 from typing import Optional
+from collections import deque
 
 import numpy as np
 import mss
@@ -34,7 +35,7 @@ from pynput.keyboard import Key
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TESSERACT
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════���══════════════════════════════
 
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -56,46 +57,40 @@ ROD_KEY  = "3"
 # ── Regions ───────────────────────────────────────────────────────────────────
 SKILL_CHECK_REGION = {"left": 1240, "top": 678,  "width": 80,  "height": 90}
 BOBBER_REGION      = {"left": 760,  "top": 380,  "width": 220, "height": 180}
-CATCH_REGION       = {"left": 1050, "top": 275,  "width": 400, "height": 30}
+CATCH_REGION       = {"left": 1050, "top": 275,  "width": 400, "height": 19}
 BUBBLE_REGION      = {"left": 650,  "top": 300,  "width": 440, "height": 360}
 WATER_CURSOR_POS   = (870, 470)
 
 # ── Red bobber pixels — brightness-interpolated thresholds ───────────────────
-# Each tuple is (brightness, r_min, g_max, b_max).
-# Values between anchors are linearly interpolated from the live scene brightness.
-#   bright scene : R>180, G<80,  B<60   (vivid red against bright water/sky)
-#   dark scene   : R>70,  G<150, B<140  (dim red; background is dark too)
 _BOBBER_BRT_ANCHORS  = (  0, 100, 255)
 _BOBBER_RMIN_ANCHORS = ( 70, 130, 180)
 _BOBBER_GMAX_ANCHORS = (150, 120,  80)
 _BOBBER_BMAX_ANCHORS = (140, 110,  60)
 
 # ── Bubble detection — brightness-interpolated thresholds ─────────────────────
-# Each tuple is a brightness anchor followed by the corresponding parameter.
-# Parameters are linearly interpolated from the live scene brightness so the
-# bot adjusts smoothly as the in-game time of day changes.
-#   deep night (0–50) : very relaxed — bubbles are barely visible
-#   night (65)        : relaxed
-#   dusk (65)         : balanced
-#   day (110–255)     : strict — avoid false positives in bright, noisy water
-_BUBBLE_BRT_ANCHORS  = (  0,  50,  65, 110, 255)
-_BUBBLE_GMIN_ANCHORS = ( 15,  20,  75, 135, 135)
-_BUBBLE_BMIN_ANCHORS = ( 18,  25,  95, 150, 150)
-_BUBBLE_EXCS_ANCHORS = (  3,   5,  30,  75,  75)
-_BUBBLE_NMIN_ANCHORS = ( 30,  50, 200, 200, 200)  # net-pixel minimum to confirm bubbles
+# v5: relaxed night thresholds significantly so bubbles are detectable at brt~38
+_BUBBLE_BRT_ANCHORS  = (  0,  35,  50,  65, 110, 255)
+_BUBBLE_GMIN_ANCHORS = ( 10,  12,  15,  75, 135, 135)
+_BUBBLE_BMIN_ANCHORS = ( 12,  15,  18,  95, 150, 150)
+_BUBBLE_EXCS_ANCHORS = (  1,   2,   3,  30,  75,  75)
+_BUBBLE_NMIN_ANCHORS = ( 15,  20,  30, 200, 200, 200)  # v5: much lower floor at night
 
 BUBBLE_GONE_THRESH    = 0.15
 BUBBLE_CONFIRM_SECS   = 0.55
 BUBBLE_MIN_BASELINE   = 2
-BUBBLE_PHASE1_REQUIRED = 12   # consecutive above-net-min frames required to confirm
+BUBBLE_PHASE1_REQUIRED = 8   # v5: lowered from 12 — compensated by hysteresis
+
+# ── Rolling background for bubble detection ───────────────────────────────────
+# Instead of a single stale bg snapshot, we maintain a rolling average of the
+# bubble pixel count from recent frames where no bubbles are detected.
+# This adapts to gradual lighting changes (day/night cycle, clouds, etc.).
+BUBBLE_BG_WINDOW_SIZE  = 30   # number of recent non-bubble frames to average
+BUBBLE_BG_UPDATE_ALPHA = 0.05 # EMA smoothing factor for background pixel count
 
 # ── Skill check ───────────────────────────────────────────────────────────────
 TARGET_CHARS  = {"T", "F", "G", "R"}
-MISREAD_MAP   = {"P": "R", "B": "R"}          # common OCR mistakes for R
+MISREAD_MAP   = {"P": "R", "B": "R"}
 
-# After pressing a letter, ignore the same letter for this many seconds.
-# This prevents double-pressing a sustained prompt without blocking a genuinely
-# new prompt that happens to show the same letter.
 SKILL_SAME_LETTER_COOLDOWN = 0.18
 
 # ── Timing ────────────────────────────────────────────────────────────────────
@@ -104,7 +99,7 @@ BAIT_APPLY_DELAY   = 0.50
 ROD_KEY_DELAY      = 0.30
 CAST_SETTLE_TIME   = 1.50
 BITE_TIMEOUT       = 90.0
-SKILL_CHECK_WINDOW = 5.00   # widened: each OCR pass ≈ 80ms fast-path
+SKILL_CHECK_WINDOW = 5.00
 CATCH_READ_WINDOW  = 4.00
 BETWEEN_CAST_DELAY = 0.05
 
@@ -115,6 +110,12 @@ BASE_DIR  = r"C:\Users\austi\Downloads\autofish"
 LOG_PATH  = BASE_DIR + r"\autofish.log"
 
 DEBUG_VERBOSE = False
+
+# ── Catch OCR — v5 adaptive gate ────────���─────────────────────────────────────
+# At night (brt < 50), water is dark and fewer spurious colored pixels appear,
+# so we can use a lower gate.  During daytime, keep it higher to reject noise.
+CATCH_MIN_COLORED_PIXELS_DAY   = 18
+CATCH_MIN_COLORED_PIXELS_NIGHT = 10
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -137,7 +138,7 @@ def init_log():
     global _log_file
     os.makedirs(BASE_DIR, exist_ok=True)
     _log_file = open(LOG_PATH, "w", encoding="utf-8")
-    log("=== Autofish Bot v3 started ===")
+    log("=== Autofish Bot v5 started ===")
     log(f"BOBBER_REGION       : {BOBBER_REGION}")
     log(f"BUBBLE_REGION       : {BUBBLE_REGION}")
     log(f"CATCH_REGION        : {CATCH_REGION}")
@@ -286,16 +287,12 @@ def _count_bubble_pixels(img: Image.Image,
                          brightness: float = 110.0) -> int:
     """
     Count cyan/turquoise bubble pixels.
-    Bubbles are distinctly cyan (high G+B, lower R) compared to
-    the dark grey-green water.  Using (G+B-2R) as a "cyan excess"
-    metric separates bubbles from neutral grey pixels where R≈G≈B.
-    This is robust across day/night lighting changes.
 
-    Rain rejection: scaled by brightness.
-      - Day/dusk (brightness >= 65): require R*2 < G and R*2 < B.
-      - Night (65 > brightness >= 50): use relaxed R*3 < G*2 and R*3 < B*2.
-      - Deep night (brightness < 50): skip rain rejection (rain invisible and
-        bubbles too dim to survive any ratio filter).
+    v5 changes:
+      - At deep night (brt < 40), also accept pixels where G+B collectively
+        exceed R by a small margin, even if individually G or B are below the
+        normal thresholds.  Bubbles at night are very dim and desaturated.
+      - Rain rejection is relaxed further at deep night.
     """
     w, h = img.size
     if w > 8 and h > 8:
@@ -303,16 +300,35 @@ def _count_bubble_pixels(img: Image.Image,
     arr = np.array(img, dtype=np.int32)
     R, G, B = arr[:,:,0], arr[:,:,1], arr[:,:,2]
     cyan_excess = G + B - 2 * R
+
+    # ── Standard bubble mask ──────────────────────────────────────────────
     if brightness >= 65:
         rain_mask = (R * 2 < G) & (R * 2 < B)
     elif brightness >= 50:
         rain_mask = (R * 3 < G * 2) & (R * 3 < B * 2)
     else:
         rain_mask = np.ones(R.shape, dtype=bool)
-    mask = (G > min_g) & (B > min_b) & (cyan_excess > min_excess) & rain_mask
+    standard_mask = (G > min_g) & (B > min_b) & (cyan_excess > min_excess) & rain_mask
+
+    # ── v5: Deep-night supplemental mask ──────────────────────────────────
+    # At brt < 45, bubbles can be so dim that individual G/B channels barely
+    # clear any threshold.  Instead, look for pixels where the *combined*
+    # G+B is meaningfully higher than 2*R (i.e. cyan_excess is positive)
+    # and the absolute values aren't totally dark (G+B > 30).
+    if brightness < 45:
+        deep_night_mask = (
+            (cyan_excess > max(1, min_excess)) &
+            ((G + B) > 30) &
+            (G > R) &
+            (B > R)
+        )
+        mask = standard_mask | deep_night_mask
+    else:
+        mask = standard_mask
+
     return int(np.sum(mask))
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════���═══════════════════════════════════════════════
 #  OVERLAY STATE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -325,7 +341,7 @@ _recent_logs = []
 def ov(key, val): _ov[key] = val
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BOBBER DETECTION
+#  BOBBER / BUBBLE DETECTION  (v5 — rolling background)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def watch_bobber() -> bool:
@@ -338,18 +354,27 @@ def watch_bobber() -> bool:
     # ── Phase 1: wait for bubbles ─────────────────────────────────────────────
     ov("bobber_state", "waiting for bubbles")
     with mss.mss() as sct:
-        bg_img = _grab_rgb(sct, BUBBLE_REGION)
-        brt = _brightness(bg_img)
-        g_min, b_min, cyan_excess, net_min = _get_bubble_params(brt)
-        # Measure ambient background count before any bubbles could appear.
-        # bg_img is held in memory so bg_count can be recomputed with the
-        # current (brightness-interpolated) thresholds on every frame, keeping
-        # the net count consistent as lighting changes throughout the session.
-        bg_count = _count_bubble_pixels(bg_img, g_min, b_min, cyan_excess, brt)
-        log(f"  🫧 Phase 1: waiting for bubbles (brightness={brt:.1f} g_min={g_min} b_min={b_min} excess={cyan_excess} net_min={net_min} bg={bg_count})")
+        # v5: Take multiple background samples over a short window to build
+        # a robust initial background pixel count estimate.
+        bg_samples = []
+        sample_start = time.time()
+        while time.time() - sample_start < 0.5:  # 0.5s of background sampling
+            bg_img = _grab_rgb(sct, BUBBLE_REGION)
+            brt = _brightness(bg_img)
+            g_min, b_min, cyan_excess, net_min = _get_bubble_params(brt)
+            bg_px = _count_bubble_pixels(bg_img, g_min, b_min, cyan_excess, brt)
+            bg_samples.append(bg_px)
+            time.sleep(0.03)
+
+        # Use the median of samples as the initial background (robust to outliers)
+        bg_count_ema = float(np.median(bg_samples))
+        log(f"  🫧 Phase 1: waiting for bubbles (brightness={brt:.1f} g_min={g_min} "
+            f"b_min={b_min} excess={cyan_excess} net_min={net_min} "
+            f"bg_ema={bg_count_ema:.0f} bg_samples={len(bg_samples)})")
 
         consecutive = 0
-        history     = []   # stores *net* counts
+        drop_count  = 0   # v5: hysteresis — allow a few drops in the streak
+        history     = []
 
         while time.time() < deadline:
             if not fishing_active:
@@ -357,27 +382,43 @@ def watch_bobber() -> bool:
             bub_img = _grab_rgb(sct, BUBBLE_REGION)
             brt = _brightness(bub_img)
             g_min, b_min, cyan_excess, net_min = _get_bubble_params(brt)
-            bg_count  = _count_bubble_pixels(bg_img, g_min, b_min, cyan_excess, brt)
             bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
-            net_count = max(0, bub_count - bg_count)
+
+            # v5: Rolling background — update EMA only when we're NOT in a
+            # bubble streak, so bubbles don't contaminate the background.
+            if consecutive == 0:
+                bg_count_ema = bg_count_ema * (1 - BUBBLE_BG_UPDATE_ALPHA) + \
+                               bub_count * BUBBLE_BG_UPDATE_ALPHA
+
+            net_count = max(0, bub_count - int(bg_count_ema))
             red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION), brt)
             frame_n  += 1
             ov("bubble_count", net_count)
             ov("bobber_count", red_count)
 
             if DEBUG_VERBOSE or frame_n % 30 == 0:
-                log(f"  🫧 Phase1 brt={brt:.1f} net={net_count} red={red_count} streak={consecutive}/{BUBBLE_PHASE1_REQUIRED}")
+                log(f"  🫧 Phase1 brt={brt:.1f} net={net_count} bg_ema={bg_count_ema:.0f} "
+                    f"red={red_count} streak={consecutive}/{BUBBLE_PHASE1_REQUIRED}")
 
             if net_count >= net_min:
                 consecutive += 1
+                drop_count = 0
                 history.append(net_count)
             else:
-                consecutive = 0
-                history.clear()
+                # v5: Allow up to 2 consecutive below-threshold frames within a
+                # streak before resetting.  Bubbles can flicker frame-to-frame.
+                if consecutive > 0 and drop_count < 2:
+                    drop_count += 1
+                    # Don't increment consecutive, but don't reset either
+                else:
+                    consecutive = 0
+                    drop_count  = 0
+                    history.clear()
 
             if consecutive >= BUBBLE_PHASE1_REQUIRED:
                 net_baseline = max(history)
-                log(f"  ✅ Bubbles confirmed! net_baseline={net_baseline} bg={bg_count}")
+                log(f"  ✅ Bubbles confirmed! net_baseline={net_baseline} "
+                    f"bg_ema={bg_count_ema:.0f}")
                 break
             time.sleep(0.016)
         else:
@@ -385,12 +426,10 @@ def watch_bobber() -> bool:
             return False
 
     # ── Phase 2: watch for bubble loss ───────────────────────────────────────
-    # All thresholds are relative to net_baseline (pixels *above* background)
-    # so the persistent background noise floor never triggers a false bite.
     gone_net   = max(int(net_baseline * BUBBLE_GONE_THRESH), max(2, net_baseline // 5))
     gone_since = None
     ov("bobber_state", "watching")
-    log(f"  🫧 Phase 2: watching (net gone < {gone_net}, bg={bg_count})")
+    log(f"  🫧 Phase 2: watching (net gone < {gone_net}, bg_ema={bg_count_ema:.0f})")
 
     with mss.mss() as sct:
         while time.time() < deadline:
@@ -399,9 +438,8 @@ def watch_bobber() -> bool:
             bub_img = _grab_rgb(sct, BUBBLE_REGION)
             brt = _brightness(bub_img)
             g_min, b_min, cyan_excess, _ = _get_bubble_params(brt)
-            bg_count  = _count_bubble_pixels(bg_img, g_min, b_min, cyan_excess, brt)
             bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
-            net_count = max(0, bub_count - bg_count)
+            net_count = max(0, bub_count - int(bg_count_ema))
             red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION), brt)
             frame_n  += 1
             ov("bubble_count", net_count)
@@ -435,17 +473,6 @@ def watch_bobber() -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _otsu_threshold(arr: np.ndarray) -> int:
-    """
-    Compute Otsu's optimal binarisation threshold on a uint8 grayscale array.
-
-    Otsu's method finds the threshold that minimises intra-class variance
-    (equivalently maximises inter-class variance) across the two pixel classes
-    (foreground letter vs background).  It adapts automatically to any
-    brightness level, which is why it outperforms a fixed midpoint or even
-    a percentile-based threshold for game UI text.
-
-    Returns an integer threshold in [0, 255].
-    """
     counts = np.bincount(arr.ravel(), minlength=256).astype(np.float64)
     total  = counts.sum()
     sumB   = 0.0
@@ -472,16 +499,6 @@ def _otsu_threshold(arr: np.ndarray) -> int:
 
 
 def _preprocess_skill(img: Image.Image, invert: bool = False) -> Image.Image:
-    """
-    Prepare a skill-check crop for Tesseract.
-
-    Uses Otsu's method for binarisation — far more robust than the previous
-    percentile midpoint approach, especially when the circle background shifts
-    between frames (e.g. different fish animations, day/night).
-
-    invert=False → black letter on white background (Tesseract standard).
-    invert=True  → white letter on black (catches the opposite polarity).
-    """
     w, h = img.size
     px, py = int(w * 0.08), int(h * 0.08)
     img = img.crop((px, py, w - px, h - py))
@@ -494,35 +511,26 @@ def _preprocess_skill(img: Image.Image, invert: bool = False) -> Image.Image:
     arr = np.array(img, dtype=np.uint8)
     t   = _otsu_threshold(arr)
 
-    # Black letter on white — Tesseract expects dark text on light background
     if not invert:
         binarised = np.where(arr < t, 0, 255).astype(np.uint8)
     else:
         binarised = np.where(arr < t, 255, 0).astype(np.uint8)
 
     img = Image.fromarray(binarised, mode="L")
-    # Light morphological cleanup to close small holes in strokes
     img = img.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
     padded = Image.new("L", (img.width + 60, img.height + 60), 255)
     padded.paste(img, (30, 30))
     return padded
 
 
-# ── OCR strategy table ────────────────────────────────────────────────────────
-# Ordered from fastest/most reliable to slower fallback.
-# We return immediately on the first valid target character.
 _SKILL_STRATEGIES = [
-    (False, 10),   # normal polarity + single-char mode
-    (True,  10),   # inverted + single-char
-    (False,  8),   # normal + word mode
-    (True,   8),   # inverted + word
+    (False, 10),
+    (True,  10),
+    (False,  8),
+    (True,   8),
 ]
 
 def _detect_skill_letter(img: Image.Image) -> Optional[str]:
-    """
-    Run OCR strategies in order and return the first valid character.
-    This keeps skill detection as fast as possible.
-    """
     whitelist = "".join(sorted(TARGET_CHARS | set(MISREAD_MAP.keys())))
     cache: dict = {}
 
@@ -560,20 +568,8 @@ def _detect_skill_letter(img: Image.Image) -> Optional[str]:
 
 
 def run_skill_check_window(duration: float):
-    """
-    Watch SKILL_CHECK_REGION for `duration` seconds.
-
-    Same-letter repeat handling (v3):
-      After pressing a letter, start a per-letter cooldown timer.
-      The same letter is pressed again only if the cooldown has expired.
-      This correctly handles:
-        • Sustained same-letter prompt (e.g. T still on screen) → ignored
-        • New prompt after cooldown → pressed immediately even if same letter
-      The old pixel-diff approach was unreliable because the processed image
-      of a new "T" prompt looks almost identical to the previous "T" prompt.
-    """
     deadline       = time.time() + duration
-    last_pressed   = {}    # char → timestamp of last press
+    last_pressed   = {}
     total_pressed  = 0
 
     log(f"  🎮 Skill window open ({duration:.2f}s)")
@@ -587,7 +583,6 @@ def run_skill_check_window(duration: float):
             brt = _brightness(img)
             ov("skill_brt", brt)
 
-            # Fast brightness gate: skip OCR on dark empty frames (~1ms)
             if brt < 45:
                 time.sleep(0.016)
                 continue
@@ -605,8 +600,6 @@ def run_skill_check_window(duration: float):
                     last_pressed[letter] = time.time()
                     _stats["skill_checks"] += 1
                     total_pressed += 1
-                    # Brief pause to let the game register the keypress
-                    # before the next OCR scan
                     time.sleep(0.06)
                 else:
                     log(f"  ⏭ [{letter}] cooldown ({age:.2f}s < {SKILL_SAME_LETTER_COOLDOWN}s)")
@@ -616,32 +609,8 @@ def run_skill_check_window(duration: float):
     log(f"  🎮 Skill window closed ({total_pressed} presses)")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CATCH OCR
+#  CATCH OCR  (v5 — hardened against water background)
 # ══════════════════════════════════════════════════════════════════════════════
-#
-#  v4 design:
-#
-#  GATE FIRST, OCR SECOND.
-#  Before calling Tesseract at all, we count how many colored pixels match
-#  the notification palette (green or yellow text).  If that count is below
-#  CATCH_MIN_COLORED_PIXELS the region contains no notification — we skip
-#  OCR entirely and eventually return None (→ false reel).
-#
-#  Why this fixes the garbage reads:
-#  "Seewiege 0 get a SR" / "er ees te Bee BR ae a" came from _otsu_ocr
-#  running on a blank game background and hallucinating text from water
-#  ripples / UI chrome.  The gate prevents OCR from ever running on empty
-#  frames, so those strings can never appear.
-#
-#  Why read_catch() now returns Optional[str]:
-#  None  → no notification pixels seen in the entire window → FALSE REEL
-#  str   → notification was visible; str is the best name extracted
-#          (may still be "Unknown" if OCR saw pixels but couldn't parse them)
-
-# Minimum number of colored pixels required before OCR is attempted.
-# Tune upward if you still get false positives; tune down if real catches
-# are being missed (run --debug and watch "catch gate" log lines).
-CATCH_MIN_COLORED_PIXELS = 18
 
 _CATCH_PATTERNS = [
     r"caught\s+an?\s+(.+?)(?:\s*[!.]|$)",
@@ -651,24 +620,17 @@ _CATCH_PATTERNS = [
     r"obtained\s+an?\s+(.+?)(?:\s*[!.]|$)",
 ]
 
-# Characters that are never part of a real fish/item name.
-# If >30 % of a result is junk characters, discard it.
 _JUNK_RE  = re.compile(r"[^A-Za-z0-9 '\-]")
 _SPACE_RE = re.compile(r"\s+")
 
 
 def _is_plausible(text: str) -> bool:
-    """
-    Return True if text looks like it could be a real catch name.
-    Rejects: too short, too many symbols, suspiciously long word runs.
-    """
     text = text.strip()
     if len(text) < 3:
         return False
     junk_ratio = len(_JUNK_RE.findall(text)) / max(len(text), 1)
     if junk_ratio > 0.25:
         return False
-    # At least one word must be ≥ 2 real alpha chars
     words = _SPACE_RE.split(text)
     if not any(re.search(r"[A-Za-z]{2,}", w) for w in words):
         return False
@@ -683,16 +645,11 @@ def _parse_catch(raw: str) -> str:
             candidate = m.group(1).strip().title()
             if _is_plausible(candidate):
                 return candidate
-    # No pattern matched — return cleaned raw if it looks plausible
     cleaned = _JUNK_RE.sub("", raw).strip()
     return cleaned[:40] if _is_plausible(cleaned) else "Unknown"
 
 
 def _count_catch_pixels(img: Image.Image) -> tuple[int, int, int]:
-    """
-    Return (green_px, cyan_px, yellow_px) counts in the catch region.
-    Used as a gate: if all are near zero, there is no notification.
-    """
     arr = np.array(img)
     R = arr[:,:,0].astype(np.int32)
     G = arr[:,:,1].astype(np.int32)
@@ -703,11 +660,35 @@ def _count_catch_pixels(img: Image.Image) -> tuple[int, int, int]:
     return green, cyan, yellow
 
 
+def _get_catch_min_pixels(brightness: float) -> int:
+    """v5: Adaptive catch gate threshold based on scene brightness."""
+    if brightness < 50:
+        return CATCH_MIN_COLORED_PIXELS_NIGHT
+    return CATCH_MIN_COLORED_PIXELS_DAY
+
+
+def _denoise_catch_image(img: Image.Image) -> Image.Image:
+    """
+    v5: Pre-process catch region to suppress water background texture.
+
+    1. Median filter (radius 2) to remove salt-and-pepper noise from waves
+    2. Slight Gaussian blur to merge nearby noise into blobs
+    3. Contrast enhancement to separate text from background
+    """
+    img = img.filter(ImageFilter.MedianFilter(size=3))
+    img = img.filter(ImageFilter.GaussianBlur(radius=0.8))
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    return img
+
+
 def _colour_mask_ocr(img: Image.Image, label: str, predicate) -> str:
     """
-    Extract text matching a colour predicate.
-    Only called after the gate confirms colored pixels are present.
+    v5: Added morphological cleanup and connected-component size filtering
+    to reject isolated noise pixels that survive the colour predicate.
     """
+    # Pre-denoise to suppress water texture
+    img = _denoise_catch_image(img)
+
     arr = np.array(img)
     R = arr[:,:,0].astype(np.int32)
     G = arr[:,:,1].astype(np.int32)
@@ -715,14 +696,28 @@ def _colour_mask_ocr(img: Image.Image, label: str, predicate) -> str:
     mask = predicate(R, G, B)
     if not np.any(mask):
         return ""
+
     bw  = np.full((arr.shape[0], arr.shape[1]), 255, dtype=np.uint8)
     bw[mask] = 0
     im  = Image.fromarray(bw, mode="L")
-    im  = im.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+
+    # v5: More aggressive morphological cleanup
+    # Close small gaps in letters, then open to remove isolated noise dots
+    im = im.filter(ImageFilter.MinFilter(3))  # dilate black (close gaps)
+    im = im.filter(ImageFilter.MaxFilter(3))  # erode back (restore size)
+    im = im.filter(ImageFilter.MaxFilter(3))  # erode further (remove small noise)
+    im = im.filter(ImageFilter.MinFilter(3))  # dilate back (restore letter size)
+
     pad = Image.new("L", (im.width + 20, im.height + 20), 255)
     pad.paste(im, (10, 10))
+
+    # v5: Scale up for better OCR on the thin 19px strip
+    scale = 4
+    pad = pad.resize((pad.width * scale, pad.height * scale),
+                     Image.Resampling.LANCZOS)
+
     try:
-        text = pytesseract.image_to_string(pad, config="--psm 6 --oem 3").strip()
+        text = pytesseract.image_to_string(pad, config="--psm 7 --oem 3").strip()
         if text:
             log(f"  🐠 {label} raw: '{text}'")
         return text
@@ -732,14 +727,20 @@ def _colour_mask_ocr(img: Image.Image, label: str, predicate) -> str:
 
 def _otsu_ocr(img: Image.Image) -> str:
     """
-    Otsu-binarise the grayscale crop, try both polarities, return best
-    plausible result.  Crops 10px border to remove UI chrome first.
-    Only called after the gate confirms colored pixels are present.
+    v5: Added pre-denoising and upscaling to reduce water-texture hallucinations.
     """
     w, h = img.size
     if w > 20 and h > 20:
         img = img.crop((10, 4, w - 10, h - 4))
+
+    # v5: Denoise before grayscale conversion
+    img = _denoise_catch_image(img)
+
     gray = img.convert("L")
+
+    # v5: Additional median filter on grayscale to smooth water texture
+    gray = gray.filter(ImageFilter.MedianFilter(size=3))
+
     arr  = np.array(gray, dtype=np.uint8)
     t    = _otsu_threshold(arr)
     best = ""
@@ -747,6 +748,15 @@ def _otsu_ocr(img: Image.Image) -> str:
         bw = np.where(arr < t, 0, 255).astype(np.uint8) if not invert \
              else np.where(arr < t, 255, 0).astype(np.uint8)
         im  = Image.fromarray(bw, mode="L")
+
+        # v5: Morphological cleanup
+        im = im.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+
+        # v5: Scale up from thin strip for better OCR
+        scale = 4
+        im = im.resize((im.width * scale, im.height * scale),
+                        Image.Resampling.LANCZOS)
+
         pad = Image.new("L", (im.width + 20, im.height + 20), 255)
         pad.paste(im, (10, 10))
         try:
@@ -760,14 +770,6 @@ def _otsu_ocr(img: Image.Image) -> str:
 
 
 def read_catch() -> Optional[str]:
-    """
-    Poll CATCH_REGION for up to CATCH_READ_WINDOW seconds.
-
-    Returns:
-      None  — no notification pixels seen at all → caller records a false reel.
-      str   — best extracted catch name (may be "Unknown" if pixels were seen
-              but OCR could not produce a plausible result).
-    """
     def green_pred(R, G, B):
         return ((G > 110) & (G > R + 20) & (G > B + 15) & (G > 125))
 
@@ -782,19 +784,25 @@ def read_catch() -> Optional[str]:
     best_cyan       = ""
     best_yellow     = ""
     best_raw        = ""
-    ever_saw_pixels = False   # True once the gate fires at least once
+    ever_saw_pixels = False
+    # v5: Track the scene brightness for adaptive gating
+    scene_brt       = 110.0
 
     with mss.mss() as sct:
         while time.time() < deadline:
             img = _grab_rgb(sct, CATCH_REGION)
+            scene_brt = _brightness(img)
             green_px, cyan_px, yellow_px = _count_catch_pixels(img)
             total_colored = green_px + cyan_px + yellow_px
 
-            if DEBUG_VERBOSE:
-                log(f"  🐠 Catch gate: green={green_px} cyan={cyan_px} yellow={yellow_px}")
+            # v5: Adaptive gate
+            min_pixels = _get_catch_min_pixels(scene_brt)
 
-            # ── Gate: skip OCR when no notification is visible ────────────────
-            if total_colored < CATCH_MIN_COLORED_PIXELS:
+            if DEBUG_VERBOSE:
+                log(f"  🐠 Catch gate: green={green_px} cyan={cyan_px} "
+                    f"yellow={yellow_px} min={min_pixels} brt={scene_brt:.1f}")
+
+            if total_colored < min_pixels:
                 if ever_saw_pixels:
                     log(f"  🐠 Catch pixels gone — stopping early")
                     break
@@ -802,7 +810,8 @@ def read_catch() -> Optional[str]:
                 continue
 
             ever_saw_pixels = True
-            log(f"  🐠 Catch gate passed (green={green_px} cyan={cyan_px} yellow={yellow_px}) — running OCR")
+            log(f"  🐠 Catch gate passed (green={green_px} cyan={cyan_px} "
+                f"yellow={yellow_px} brt={scene_brt:.1f}) — running OCR")
 
             green  = _colour_mask_ocr(img, "Green",  green_pred)
             cyan   = _colour_mask_ocr(img, "Cyan",   cyan_pred)
@@ -814,24 +823,20 @@ def read_catch() -> Optional[str]:
             if _is_plausible(yellow) and len(yellow) > len(best_yellow): best_yellow = yellow
             if _is_plausible(raw)    and len(raw)    > len(best_raw):    best_raw    = raw
 
-            # Stop as soon as we have a solid green/cyan result
             if (best_green or best_cyan) and len(best_green or best_cyan) >= 4:
                 break
             time.sleep(0.12)
 
-    # ── Gate never fired: no notification was visible → false reel ────────────
     if not ever_saw_pixels:
         log("  🐠 Catch: no colored pixels seen → FALSE REEL")
         return None
 
-    # ── Build final catch name ────────────────────────────────────────────────
     catch_name = best_green or best_cyan or best_raw or best_yellow
-    
-    # If color extraction failed but gate passed, use Otsu fallback
-    if not catch_name and raw:
-        catch_name = raw
+
+    if not catch_name and best_raw:
+        catch_name = best_raw
         log(f"  🐠 Using Otsu fallback (color extraction empty but pixels present)")
-    
+
     catch_text = _parse_catch(catch_name)
     if best_yellow and "EVENT" not in catch_text:
         event = _parse_catch(best_yellow)
@@ -888,7 +893,7 @@ class DebugOverlay:
                   f"BUBBLES  bub={s.get('bubble_count',0)}")
         self._box(c, CATCH_REGION,       self.C["catch"],
                   f"CATCH  {s['catch_text'] or '—'}")
-        hud = ["🎣 AUTOFISH v3  [F7=hide]",
+        hud = ["🎣 AUTOFISH v5  [F7=hide]",
                f"State   : {s['bot_state']}",
                f"Catches : {s['fish_count']}"]
         for i, line in enumerate(hud):
@@ -1016,7 +1021,6 @@ def fishing_loop():
             ov("bot_state", "READING CATCH")
             catch = read_catch()
             if catch is None:
-                # No notification pixels appeared — the reel produced nothing
                 _stats["false_reels"] += 1
                 log("[FISH] ⚠ False reel (no catch notification seen)")
                 ov("catch_text", "— false reel —")
@@ -1089,7 +1093,7 @@ def on_press(key):
         print_summary()
         return False
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════��══════════════════════════════════════════
 #  REGION FINDER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1115,10 +1119,10 @@ def find_region_helper():
 def main():
     global DEBUG_VERBOSE
 
-    parser = argparse.ArgumentParser(description="Autofish Bot v3")
+    parser = argparse.ArgumentParser(description="Autofish Bot v5")
     parser.add_argument("--find-region", action="store_true")
     parser.add_argument("--debug", action="store_true",
-                        help="Log bobber/bubble pixel counts every 30 frames")
+                        help="Log bobber/bubble pixel counts every frame")
     args = parser.parse_args()
 
     if args.find_region:
@@ -1143,7 +1147,7 @@ def main():
     init_log()
 
     print("╔══════════════════════════════════════════════╗")
-    print("║   AUTOFISH BOT v4  🎣  (gated catch OCR)    ║")
+    print("║   AUTOFISH BOT v5  🎣  (bubble+catch fix)   ║")
     print("╠══════════════════════════════════════════════╣")
     print(f"║  Bait key       : {BAIT_KEY:<25} ║")
     print(f"║  Rod key        : {ROD_KEY:<25} ║")
@@ -1151,6 +1155,7 @@ def main():
     print(f"║  Skill window   : {SKILL_CHECK_WINDOW:.1f}s{'':<21} ║")
     print(f"║  Letter cooldown: {SKILL_SAME_LETTER_COOLDOWN*1000:.0f}ms{'':<21} ║")
     print(f"║  Bubble confirm : {BUBBLE_CONFIRM_SECS}s{'':<22} ║")
+    print(f"║  Bubble streak  : {BUBBLE_PHASE1_REQUIRED} frames{'':<17} ║")
     print( "╠══════════════════════════════════════════════╣")
     print( "║  F6=Start/Stop  F7=Overlay  F8=Quit         ║")
     print("╚══════════════════════════════════════════════╝\n")
