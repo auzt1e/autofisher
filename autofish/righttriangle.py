@@ -341,6 +341,29 @@ def _get_bubble_params(brightness: float):
     return g_min, b_min, cyan_excess, net_min
 
 
+def _rain_tier_label(brightness: float) -> str:
+    """Return a human-readable label for the rain filter tier active at *brightness*."""
+    if brightness >= 90:
+        return "strict"
+    elif brightness >= 50:
+        return "moderate"
+    else:
+        return "none"
+
+
+def _pixel_channel_stats(img: Image.Image) -> str:
+    """Return a compact string with per-channel mean R/G/B and the mean cyan_excess."""
+    inset = BUBBLE_REGION_INSET
+    w, h = img.size
+    if w > 8 and h > 8:
+        img = img.crop((inset, inset, w - inset, h - inset))
+    arr = np.array(img, dtype=np.int32)
+    R, G, B = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    cyan_ex = G + B - 2 * R
+    return (f"avgR={float(R.mean()):.1f} avgG={float(G.mean()):.1f} "
+            f"avgB={float(B.mean()):.1f} avgCyan={float(cyan_ex.mean()):.1f}")
+
+
 def _get_bobber_thresholds(brightness: float):
     """Return (r_min, g_max, b_max) for bobber detection, interpolated from brightness."""
     brt = float(brightness)
@@ -496,9 +519,16 @@ def watch_bobber() -> bool:
 
         # Use the median of samples as the initial background (robust to outliers)
         bg_count_ema = float(np.median(bg_samples))
+        bg_arr = np.array(bg_samples)
+        deep_night_active = brt < 45
+        rain_tier = _rain_tier_label(brt)
+        chan_stats = _pixel_channel_stats(bg_img)
         log(f"  🫧 Phase 1: waiting for bubbles (brightness={brt:.1f} g_min={g_min} "
             f"b_min={b_min} excess={cyan_excess} net_min={net_min} "
-            f"bg_ema={bg_count_ema:.0f} bg_samples={len(bg_samples)})")
+            f"bg_ema={bg_count_ema:.0f} bg_samples={len(bg_samples)} "
+            f"bg_min={int(bg_arr.min())} bg_max={int(bg_arr.max())} "
+            f"rain={rain_tier} deep_night={deep_night_active})")
+        log(f"  🫧 BG pixel stats: {chan_stats}")
 
         consecutive = 0
         drop_count  = 0   # v5: hysteresis — allow a few drops in the streak
@@ -521,8 +551,15 @@ def watch_bobber() -> bool:
             ov("bobber_count", red_count)
 
             if DEBUG_VERBOSE or frame_n % 30 == 0:
-                log(f"  🫧 Phase1 brt={brt:.1f} net={net_count} bg_ema={bg_count_ema:.0f} "
-                    f"red={red_count} streak={consecutive}/{BUBBLE_PHASE1_REQUIRED}")
+                rain_tier = _rain_tier_label(brt)
+                deep_night_active = brt < 45
+                log(f"  🫧 Phase1 brt={brt:.1f} raw={bub_count} net={net_count} "
+                    f"bg_ema={bg_count_ema:.0f} red={red_count} "
+                    f"streak={consecutive}/{BUBBLE_PHASE1_REQUIRED} "
+                    f"g_min={g_min} b_min={b_min} ex={cyan_excess} nmin={net_min} "
+                    f"rain={rain_tier} deep_night={deep_night_active}")
+                if frame_n % 90 == 0:
+                    log(f"  🫧 Channel stats: {_pixel_channel_stats(bub_img)}")
 
             if net_count >= net_min:
                 consecutive += 1
@@ -533,7 +570,8 @@ def watch_bobber() -> bool:
                 # streak before resetting.  Bubbles can flicker frame-to-frame.
                 if consecutive > 0 and drop_count < 2:
                     drop_count += 1
-                    # Don't increment consecutive, but don't reset either
+                    log(f"  🫧 Hysteresis drop {drop_count}/2 "
+                        f"(net={net_count} < nmin={net_min}, streak kept at {consecutive})")
                 else:
                     consecutive = 0
                     drop_count  = 0
@@ -554,7 +592,8 @@ def watch_bobber() -> bool:
     gone_net   = max(int(net_baseline * BUBBLE_GONE_THRESH), max(2, net_baseline // 5))
     gone_since = None
     ov("bobber_state", "watching")
-    log(f"  🫧 Phase 2: watching (net gone < {gone_net}, bg_ema={bg_count_ema:.0f})")
+    log(f"  🫧 Phase 2: watching (net gone < {gone_net}, bg_ema={bg_count_ema:.0f} "
+        f"baseline={net_baseline})")
 
     with mss.mss() as sct:
         while time.time() < deadline:
@@ -574,7 +613,12 @@ def watch_bobber() -> bool:
 
             if DEBUG_VERBOSE or frame_n % 30 == 0:
                 gs = f"{time.time()-gone_since:.2f}s" if gone_since else "no"
-                log(f"  🫧 net={net_count}/{net_baseline} gone_timer={gs}")
+                rain_tier = _rain_tier_label(brt)
+                deep_night_active = brt < 45
+                log(f"  🫧 Phase2 brt={brt:.1f} raw={bub_count} net={net_count}/{net_baseline} "
+                    f"gone_timer={gs} rain={rain_tier} deep_night={deep_night_active}")
+                if frame_n % 90 == 0:
+                    log(f"  🫧 Channel stats: {_pixel_channel_stats(bub_img)}")
 
             if net_count < gone_net:
                 if gone_since is None:
