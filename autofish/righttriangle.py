@@ -147,6 +147,7 @@ def init_log():
     log(f"BOBBER_REGION       : {BOBBER_REGION}")
     log(f"BUBBLE_REGION       : {BUBBLE_REGION}")
     log(f"CATCH_REGION        : {CATCH_REGION}")
+    log(f"SKILL_CHECK_REGION  : {SKILL_CHECK_REGION}")
     log(f"SKILL_CHECK_WINDOW  : {SKILL_CHECK_WINDOW}s")
     log(f"TARGET_CHARS        : {sorted(TARGET_CHARS)}")
 
@@ -710,6 +711,8 @@ def run_skill_check_window(duration: float):
     with mss.mss() as sct:
         while time.time() < deadline:
             if not fishing_active:
+                if total_pressed == 0:
+                    log(f"  ⚠ Skill window interrupted with 0 presses — check SKILL_CHECK_REGION {SKILL_CHECK_REGION}")
                 return
 
             img = _grab_rgb(sct, SKILL_CHECK_REGION)
@@ -739,7 +742,10 @@ def run_skill_check_window(duration: float):
 
             time.sleep(0.008)
 
-    log(f"  🎮 Skill window closed ({total_pressed} presses)")
+    if total_pressed == 0:
+        log(f"  ⚠ Skill window closed with 0 presses — check SKILL_CHECK_REGION {SKILL_CHECK_REGION}")
+    else:
+        log(f"  🎮 Skill window closed ({total_pressed} presses)")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CATCH OCR  (v5 — hardened against water background)
