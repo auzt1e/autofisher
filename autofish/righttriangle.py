@@ -87,6 +87,10 @@ BUBBLE_PHASE1_REQUIRED = 8   # v5: lowered from 12 — compensated by hysteresis
 BUBBLE_BG_WINDOW_SIZE  = 30   # number of recent non-bubble frames to average
 BUBBLE_BG_UPDATE_ALPHA = 0.05 # EMA smoothing factor for background pixel count
 
+# Inset (pixels) cropped from each edge of BUBBLE_REGION before pixel analysis.
+# Avoids counting overlay border artifacts as bubble pixels.
+BUBBLE_REGION_INSET = 4
+
 # ── Skill check ───────────────────────────────────────────────────────────────
 TARGET_CHARS  = {"T", "F", "G", "R"}
 MISREAD_MAP   = {"P": "R", "B": "R"}
@@ -162,15 +166,6 @@ _CONFIG_KEYS = [
 ]
 
 def load_config():
-    global BOBBER_REGION, BUBBLE_REGION, SKILL_CHECK_REGION, CATCH_REGION
-    global BUBBLE_MIN_BASELINE, BUBBLE_GONE_THRESH, BUBBLE_CONFIRM_SECS
-    global BUBBLE_PHASE1_REQUIRED, BAIT_KEY, ROD_KEY, TARGET_CHARS
-    global SKILL_CHECK_WINDOW, CATCH_READ_WINDOW, BITE_TIMEOUT
-    global BAIT_KEY_DELAY, BAIT_APPLY_DELAY, ROD_KEY_DELAY
-    global CAST_SETTLE_TIME, BETWEEN_CAST_DELAY, SKILL_SAME_LETTER_COOLDOWN
-    global CATCH_MIN_COLORED_PIXELS_DAY, CATCH_MIN_COLORED_PIXELS_NIGHT
-    global WATER_CURSOR_POS
-
     if not os.path.isfile(CONFIG_PATH):
         print("[CONFIG] No config file, using defaults")
         return
@@ -182,38 +177,16 @@ def load_config():
         print(f"[CONFIG] Warning: could not read config file ({e}), using defaults")
         return
 
+    g = globals()
     for key, value in data.items():
         if key not in _CONFIG_KEYS:
             continue
-        # Special conversions
+        # Special type conversions for non-JSON-native types
         if key == "TARGET_CHARS":
             value = set(value)
         elif key == "WATER_CURSOR_POS":
             value = tuple(value)
-        # Assign to the matching global
-        if key == "BOBBER_REGION":          BOBBER_REGION = value
-        elif key == "BUBBLE_REGION":        BUBBLE_REGION = value
-        elif key == "SKILL_CHECK_REGION":   SKILL_CHECK_REGION = value
-        elif key == "CATCH_REGION":         CATCH_REGION = value
-        elif key == "BUBBLE_MIN_BASELINE":  BUBBLE_MIN_BASELINE = value
-        elif key == "BUBBLE_GONE_THRESH":   BUBBLE_GONE_THRESH = value
-        elif key == "BUBBLE_CONFIRM_SECS":  BUBBLE_CONFIRM_SECS = value
-        elif key == "BUBBLE_PHASE1_REQUIRED": BUBBLE_PHASE1_REQUIRED = value
-        elif key == "BAIT_KEY":             BAIT_KEY = value
-        elif key == "ROD_KEY":              ROD_KEY = value
-        elif key == "TARGET_CHARS":         TARGET_CHARS = value
-        elif key == "SKILL_CHECK_WINDOW":   SKILL_CHECK_WINDOW = value
-        elif key == "CATCH_READ_WINDOW":    CATCH_READ_WINDOW = value
-        elif key == "BITE_TIMEOUT":         BITE_TIMEOUT = value
-        elif key == "BAIT_KEY_DELAY":       BAIT_KEY_DELAY = value
-        elif key == "BAIT_APPLY_DELAY":     BAIT_APPLY_DELAY = value
-        elif key == "ROD_KEY_DELAY":        ROD_KEY_DELAY = value
-        elif key == "CAST_SETTLE_TIME":     CAST_SETTLE_TIME = value
-        elif key == "BETWEEN_CAST_DELAY":   BETWEEN_CAST_DELAY = value
-        elif key == "SKILL_SAME_LETTER_COOLDOWN": SKILL_SAME_LETTER_COOLDOWN = value
-        elif key == "CATCH_MIN_COLORED_PIXELS_DAY":   CATCH_MIN_COLORED_PIXELS_DAY = value
-        elif key == "CATCH_MIN_COLORED_PIXELS_NIGHT": CATCH_MIN_COLORED_PIXELS_NIGHT = value
-        elif key == "WATER_CURSOR_POS":     WATER_CURSOR_POS = value
+        g[key] = value
         print(f"[CONFIG] Config override: {key} = {value}")
 
 
@@ -402,7 +375,8 @@ def _count_bubble_pixels(img: Image.Image,
     """
     w, h = img.size
     if w > 8 and h > 8:
-        img = img.crop((4, 4, w - 4, h - 4))
+        inset = BUBBLE_REGION_INSET
+        img = img.crop((inset, inset, w - inset, h - inset))
     arr = np.array(img, dtype=np.int32)
     R, G, B = arr[:,:,0], arr[:,:,1], arr[:,:,2]
     cyan_excess = G + B - 2 * R
@@ -439,14 +413,15 @@ def _bubble_stats(img: Image.Image, brightness: float):
     """
     Like _count_bubble_pixels but also returns the bounding box of detected
     bubble pixels as (min_x, min_y, max_x, max_y) relative to the cropped
-    image (after 4px inset), or None when no pixels are found.
+    image (after BUBBLE_REGION_INSET crop), or None when no pixels are found.
 
     Returns (count, bbox).
     """
     g_min, b_min, min_excess, _ = _get_bubble_params(brightness)
     w, h = img.size
     if w > 8 and h > 8:
-        img = img.crop((4, 4, w - 4, h - 4))
+        inset = BUBBLE_REGION_INSET
+        img = img.crop((inset, inset, w - inset, h - inset))
     arr = np.array(img, dtype=np.int32)
     R, G, B = arr[:,:,0], arr[:,:,1], arr[:,:,2]
     cyan_excess = G + B - 2 * R
@@ -1049,8 +1024,8 @@ class DebugOverlay:
                   f"BUBBLES  bub={s.get('bubble_count',0)}")
         bbox = s.get("bubble_bbox")
         if bbox is not None:
-            ox = BUBBLE_REGION["left"] + 4
-            oy = BUBBLE_REGION["top"] + 4
+            ox = BUBBLE_REGION["left"] + BUBBLE_REGION_INSET
+            oy = BUBBLE_REGION["top"] + BUBBLE_REGION_INSET
             bx1 = ox + bbox[0]
             by1 = oy + bbox[1]
             bx2 = ox + bbox[2]
@@ -1347,7 +1322,7 @@ class ControlPanel:
         self.win.wm_attributes("-topmost", True)
         self.win.configure(bg="#1a1a1a")
         self.win.resizable(False, False)
-        self.win.protocol("WM_DELETE_WINDOW", lambda: None)  # prevent accidental close
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)  # use Quit button to exit
 
         # Status labels
         self._state_var = tk.StringVar(value="IDLE")
