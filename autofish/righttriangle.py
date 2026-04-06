@@ -76,7 +76,7 @@ _BUBBLE_EXCS_ANCHORS = (  1,   2,   3,  30,  75,  75)
 _BUBBLE_NMIN_ANCHORS = ( 15,  20,  30, 200, 200, 200)  # v5: much lower floor at night
 
 BUBBLE_GONE_THRESH    = 0.15
-BUBBLE_CONFIRM_SECS   = 0.55
+BUBBLE_CONFIRM_SECS   = 1.2
 BUBBLE_MIN_BASELINE   = 2
 BUBBLE_PHASE1_REQUIRED = 8   # v5: lowered from 12 — compensated by hysteresis
 
@@ -482,7 +482,7 @@ def watch_bobber() -> bool:
         # a robust initial background pixel count estimate.
         bg_samples = []
         sample_start = time.time()
-        while time.time() - sample_start < 0.5:  # 0.5s of background sampling
+        while time.time() - sample_start < 2.0:  # 2.0s of background sampling
             bg_img = _grab_rgb(sct, BUBBLE_REGION)
             brt = _brightness(bg_img)
             g_min, b_min, cyan_excess, net_min = _get_bubble_params(brt)
@@ -507,15 +507,8 @@ def watch_bobber() -> bool:
             bub_img = _grab_rgb(sct, BUBBLE_REGION)
             brt = _brightness(bub_img)
             g_min, b_min, cyan_excess, net_min = _get_bubble_params(brt)
-            bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
-            _, bbox = _bubble_stats(bub_img, brt)
+            bub_count, bbox = _bubble_stats(bub_img, brt)
             ov("bubble_bbox", bbox)
-
-            # v5: Rolling background — update EMA only when we're NOT in a
-            # bubble streak, so bubbles don't contaminate the background.
-            if consecutive == 0:
-                bg_count_ema = bg_count_ema * (1 - BUBBLE_BG_UPDATE_ALPHA) + \
-                               bub_count * BUBBLE_BG_UPDATE_ALPHA
 
             net_count = max(0, bub_count - int(bg_count_ema))
             red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION), brt)
@@ -567,8 +560,7 @@ def watch_bobber() -> bool:
             bub_img = _grab_rgb(sct, BUBBLE_REGION)
             brt = _brightness(bub_img)
             g_min, b_min, cyan_excess, _ = _get_bubble_params(brt)
-            bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
-            _, bbox = _bubble_stats(bub_img, brt)
+            bub_count, bbox = _bubble_stats(bub_img, brt)
             ov("bubble_bbox", bbox)
             net_count = max(0, bub_count - int(bg_count_ema))
             red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION), brt)
@@ -987,7 +979,7 @@ def read_catch() -> Optional[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DebugOverlay:
-    C = {"skill": "#00FF41", "bobber": "#FF6B35", "catch": "#00D4FF"}
+    C = {"skill": "#00FF41", "bobber": "#FF6B35", "catch": "#FFFF00"}
 
     def __init__(self):
         self.root = tk.Tk()
@@ -1100,7 +1092,7 @@ class RegionEditor:
         "BOBBER_REGION":      "#FF6B35",
         "BUBBLE_REGION":      "#FF00FF",
         "SKILL_CHECK_REGION": "#00FF41",
-        "CATCH_REGION":       "#00D4FF",
+        "CATCH_REGION":       "#FFFF00",
     }
     _HANDLE_SIZE = 8
 
