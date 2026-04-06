@@ -69,11 +69,13 @@ _BOBBER_BMAX_ANCHORS = (140, 110,  60)
 
 # ── Bubble detection — brightness-interpolated thresholds ─────────────────────
 # v5: relaxed night thresholds significantly so bubbles are detectable at brt~38
-_BUBBLE_BRT_ANCHORS  = (  0,  35,  50,  65, 110, 255)
-_BUBBLE_GMIN_ANCHORS = ( 10,  12,  15,  75, 135, 135)
-_BUBBLE_BMIN_ANCHORS = ( 12,  15,  18,  95, 150, 150)
-_BUBBLE_EXCS_ANCHORS = (  1,   2,   3,  30,  75,  75)
-_BUBBLE_NMIN_ANCHORS = ( 15,  20,  30, 200, 200, 200)  # v5: much lower floor at night
+# v6: added brt=85 anchor and smoothed the 65→110 transition so that game
+#     nighttime (brt ~80-90) no longer produces unreachably high thresholds.
+_BUBBLE_BRT_ANCHORS  = (  0,  35,  50,  65,  85, 110, 255)
+_BUBBLE_GMIN_ANCHORS = ( 10,  12,  15,  50,  85, 135, 135)
+_BUBBLE_BMIN_ANCHORS = ( 12,  15,  18,  65, 100, 150, 150)
+_BUBBLE_EXCS_ANCHORS = (  1,   2,   3,  15,  35,  75,  75)
+_BUBBLE_NMIN_ANCHORS = ( 15,  20,  30, 100, 150, 200, 200)
 
 BUBBLE_GONE_THRESH    = 0.15
 BUBBLE_CONFIRM_SECS   = 1.2
@@ -382,7 +384,9 @@ def _count_bubble_pixels(img: Image.Image,
     cyan_excess = G + B - 2 * R
 
     # ── Standard bubble mask ──────────────────────────────────────────────
-    if brightness >= 65:
+    # v6: raised strict rain filter boundary from 65→90 so game-nighttime
+    #     (brt ~80-85) uses the moderate filter instead of the strict one.
+    if brightness >= 90:
         rain_mask = (R * 2 < G) & (R * 2 < B)
     elif brightness >= 50:
         rain_mask = (R * 3 < G * 2) & (R * 3 < B * 2)
@@ -426,7 +430,7 @@ def _bubble_stats(img: Image.Image, brightness: float):
     R, G, B = arr[:,:,0], arr[:,:,1], arr[:,:,2]
     cyan_excess = G + B - 2 * R
 
-    if brightness >= 65:
+    if brightness >= 90:
         rain_mask = (R * 2 < G) & (R * 2 < B)
     elif brightness >= 50:
         rain_mask = (R * 3 < G * 2) & (R * 3 < B * 2)
