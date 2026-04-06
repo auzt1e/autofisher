@@ -78,6 +78,8 @@ BUBBLE_NIGHT_CYAN_EXCESS = 15
 BUBBLE_GONE_THRESH    = 0.15
 BUBBLE_CONFIRM_SECS   = 0.55
 BUBBLE_MIN_BASELINE   = 2
+BUBBLE_NET_MIN        = 200   # minimum *net* pixels above background to count as bubbles
+BUBBLE_PHASE1_REQUIRED = 12   # consecutive above-net-min frames required to confirm
 
 # ── Skill check ───────────────────────────────────────────────────────────────
 TARGET_CHARS  = {"T", "F", "G", "R"}
@@ -329,11 +331,15 @@ def watch_bobber() -> bool:
         img = _grab_rgb(sct, BUBBLE_REGION)
         brt = _brightness(img)
         g_min, b_min, cyan_excess = _get_bubble_thresholds(brt)
-        log(f"  🫧 Phase 1: waiting for bubbles (brightness={brt:.1f})")
+        # Measure ambient background count before any bubbles could appear.
+        # All subsequent checks use *net* count (above background) so that
+        # normal night-water pixels (~317 at brightness≈44) never register as
+        # bubbles, regardless of the absolute threshold values.
+        bg_count  = _count_bubble_pixels(img, g_min, b_min, cyan_excess, brt)
+        log(f"  🫧 Phase 1: waiting for bubbles (brightness={brt:.1f} bg={bg_count})")
 
         consecutive = 0
-        REQUIRED    = 6
-        history     = []
+        history     = []   # stores *net* counts
 
         while time.time() < deadline:
             if not fishing_active:
@@ -345,24 +351,25 @@ def watch_bobber() -> bool:
                 if DEBUG_VERBOSE:
                     log(f"  🫧 Phase1 thresholds updated: brightness={brt:.1f}")
             bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
+            net_count = max(0, bub_count - bg_count)
             red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION))
             frame_n  += 1
-            ov("bubble_count", bub_count)
+            ov("bubble_count", net_count)
             ov("bobber_count", red_count)
 
             if DEBUG_VERBOSE or frame_n % 30 == 0:
-                log(f"  🫧 Phase1: bub={bub_count} red={red_count} streak={consecutive}/{REQUIRED}")
+                log(f"  🫧 Phase1: net={net_count} red={red_count} streak={consecutive}/{BUBBLE_PHASE1_REQUIRED}")
 
-            if bub_count >= BUBBLE_MIN_BASELINE:
+            if net_count >= BUBBLE_NET_MIN:
                 consecutive += 1
-                history.append(bub_count)
+                history.append(net_count)
             else:
                 consecutive = 0
                 history.clear()
 
-            if consecutive >= REQUIRED:
-                bubble_baseline = max(history)
-                log(f"  ✅ Bubbles confirmed! baseline={bubble_baseline}")
+            if consecutive >= BUBBLE_PHASE1_REQUIRED:
+                net_baseline = max(history)
+                log(f"  ✅ Bubbles confirmed! net_baseline={net_baseline} bg={bg_count}")
                 break
             time.sleep(0.016)
         else:
@@ -370,10 +377,12 @@ def watch_bobber() -> bool:
             return False
 
     # ── Phase 2: watch for bubble loss ───────────────────────────────────────
-    gone_abs   = max(int(bubble_baseline * BUBBLE_GONE_THRESH), max(2, bubble_baseline // 5))
+    # All thresholds are relative to net_baseline (pixels *above* background)
+    # so the persistent background noise floor never triggers a false bite.
+    gone_net   = max(int(net_baseline * BUBBLE_GONE_THRESH), max(2, net_baseline // 5))
     gone_since = None
     ov("bobber_state", "watching")
-    log(f"  🫧 Phase 2: watching (gone < {gone_abs})")
+    log(f"  🫧 Phase 2: watching (net gone < {gone_net}, bg={bg_count})")
 
     with mss.mss() as sct:
         while time.time() < deadline:
@@ -386,20 +395,21 @@ def watch_bobber() -> bool:
                 if DEBUG_VERBOSE:
                     log(f"  🫧 Phase2 thresholds updated: brightness={brt:.1f}")
             bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
+            net_count = max(0, bub_count - bg_count)
             red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION))
             frame_n  += 1
-            ov("bubble_count", bub_count)
+            ov("bubble_count", net_count)
             ov("bobber_count", red_count)
 
             if DEBUG_VERBOSE or frame_n % 30 == 0:
                 gs = f"{time.time()-gone_since:.2f}s" if gone_since else "no"
-                log(f"  🫧 bub={bub_count}/{bubble_baseline} gone_timer={gs}")
+                log(f"  🫧 net={net_count}/{net_baseline} gone_timer={gs}")
 
-            if bub_count < gone_abs:
+            if net_count < gone_net:
                 if gone_since is None:
                     gone_since = time.time()
                     ov("bobber_state", "no bubbles")
-                    log(f"  👀 Bubbles vanished ({bub_count} < {gone_abs})")
+                    log(f"  👀 Bubbles vanished (net {net_count} < {gone_net})")
                 elif time.time() - gone_since >= BUBBLE_CONFIRM_SECS:
                     log(f"  🐟 BITE! Gone for {time.time()-gone_since:.2f}s")
                     ov("bobber_state", "bite")
