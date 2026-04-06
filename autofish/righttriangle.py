@@ -21,7 +21,7 @@ Fixes vs v4:
   • Catch OCR: median-filter pre-pass to suppress water ripple texture
 """
 
-import os, sys, time, threading, argparse, ctypes, shutil, re
+import os, sys, time, threading, argparse, ctypes, shutil, re, json
 from typing import Optional
 from collections import deque
 
@@ -106,8 +106,9 @@ BETWEEN_CAST_DELAY = 0.05
 HOTKEY_TOGGLE = Key.f6
 HOTKEY_QUIT   = Key.f8
 
-BASE_DIR  = r"C:\Users\austi\Downloads\autofish"
-LOG_PATH  = BASE_DIR + r"\autofish.log"
+BASE_DIR    = r"C:\Users\austi\Downloads\autofish"
+LOG_PATH    = BASE_DIR + r"\autofish.log"
+CONFIG_PATH = BASE_DIR + r"\autofish_config.json"
 
 DEBUG_VERBOSE = False
 
@@ -144,6 +145,111 @@ def init_log():
     log(f"CATCH_REGION        : {CATCH_REGION}")
     log(f"SKILL_CHECK_WINDOW  : {SKILL_CHECK_WINDOW}s")
     log(f"TARGET_CHARS        : {sorted(TARGET_CHARS)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIG FILE
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CONFIG_KEYS = [
+    "BOBBER_REGION", "BUBBLE_REGION", "SKILL_CHECK_REGION", "CATCH_REGION",
+    "BUBBLE_MIN_BASELINE", "BUBBLE_GONE_THRESH", "BUBBLE_CONFIRM_SECS",
+    "BUBBLE_PHASE1_REQUIRED", "BAIT_KEY", "ROD_KEY", "TARGET_CHARS",
+    "SKILL_CHECK_WINDOW", "CATCH_READ_WINDOW", "BITE_TIMEOUT",
+    "BAIT_KEY_DELAY", "BAIT_APPLY_DELAY", "ROD_KEY_DELAY",
+    "CAST_SETTLE_TIME", "BETWEEN_CAST_DELAY", "SKILL_SAME_LETTER_COOLDOWN",
+    "CATCH_MIN_COLORED_PIXELS_DAY", "CATCH_MIN_COLORED_PIXELS_NIGHT",
+    "WATER_CURSOR_POS",
+]
+
+def load_config():
+    global BOBBER_REGION, BUBBLE_REGION, SKILL_CHECK_REGION, CATCH_REGION
+    global BUBBLE_MIN_BASELINE, BUBBLE_GONE_THRESH, BUBBLE_CONFIRM_SECS
+    global BUBBLE_PHASE1_REQUIRED, BAIT_KEY, ROD_KEY, TARGET_CHARS
+    global SKILL_CHECK_WINDOW, CATCH_READ_WINDOW, BITE_TIMEOUT
+    global BAIT_KEY_DELAY, BAIT_APPLY_DELAY, ROD_KEY_DELAY
+    global CAST_SETTLE_TIME, BETWEEN_CAST_DELAY, SKILL_SAME_LETTER_COOLDOWN
+    global CATCH_MIN_COLORED_PIXELS_DAY, CATCH_MIN_COLORED_PIXELS_NIGHT
+    global WATER_CURSOR_POS
+
+    if not os.path.isfile(CONFIG_PATH):
+        print("[CONFIG] No config file, using defaults")
+        return
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[CONFIG] Warning: could not read config file ({e}), using defaults")
+        return
+
+    for key, value in data.items():
+        if key not in _CONFIG_KEYS:
+            continue
+        # Special conversions
+        if key == "TARGET_CHARS":
+            value = set(value)
+        elif key == "WATER_CURSOR_POS":
+            value = tuple(value)
+        # Assign to the matching global
+        if key == "BOBBER_REGION":          BOBBER_REGION = value
+        elif key == "BUBBLE_REGION":        BUBBLE_REGION = value
+        elif key == "SKILL_CHECK_REGION":   SKILL_CHECK_REGION = value
+        elif key == "CATCH_REGION":         CATCH_REGION = value
+        elif key == "BUBBLE_MIN_BASELINE":  BUBBLE_MIN_BASELINE = value
+        elif key == "BUBBLE_GONE_THRESH":   BUBBLE_GONE_THRESH = value
+        elif key == "BUBBLE_CONFIRM_SECS":  BUBBLE_CONFIRM_SECS = value
+        elif key == "BUBBLE_PHASE1_REQUIRED": BUBBLE_PHASE1_REQUIRED = value
+        elif key == "BAIT_KEY":             BAIT_KEY = value
+        elif key == "ROD_KEY":              ROD_KEY = value
+        elif key == "TARGET_CHARS":         TARGET_CHARS = value
+        elif key == "SKILL_CHECK_WINDOW":   SKILL_CHECK_WINDOW = value
+        elif key == "CATCH_READ_WINDOW":    CATCH_READ_WINDOW = value
+        elif key == "BITE_TIMEOUT":         BITE_TIMEOUT = value
+        elif key == "BAIT_KEY_DELAY":       BAIT_KEY_DELAY = value
+        elif key == "BAIT_APPLY_DELAY":     BAIT_APPLY_DELAY = value
+        elif key == "ROD_KEY_DELAY":        ROD_KEY_DELAY = value
+        elif key == "CAST_SETTLE_TIME":     CAST_SETTLE_TIME = value
+        elif key == "BETWEEN_CAST_DELAY":   BETWEEN_CAST_DELAY = value
+        elif key == "SKILL_SAME_LETTER_COOLDOWN": SKILL_SAME_LETTER_COOLDOWN = value
+        elif key == "CATCH_MIN_COLORED_PIXELS_DAY":   CATCH_MIN_COLORED_PIXELS_DAY = value
+        elif key == "CATCH_MIN_COLORED_PIXELS_NIGHT": CATCH_MIN_COLORED_PIXELS_NIGHT = value
+        elif key == "WATER_CURSOR_POS":     WATER_CURSOR_POS = value
+        print(f"[CONFIG] Config override: {key} = {value}")
+
+
+def save_config():
+    data = {
+        "BOBBER_REGION":       BOBBER_REGION,
+        "BUBBLE_REGION":       BUBBLE_REGION,
+        "SKILL_CHECK_REGION":  SKILL_CHECK_REGION,
+        "CATCH_REGION":        CATCH_REGION,
+        "BUBBLE_MIN_BASELINE": BUBBLE_MIN_BASELINE,
+        "BUBBLE_GONE_THRESH":  BUBBLE_GONE_THRESH,
+        "BUBBLE_CONFIRM_SECS": BUBBLE_CONFIRM_SECS,
+        "BUBBLE_PHASE1_REQUIRED": BUBBLE_PHASE1_REQUIRED,
+        "BAIT_KEY":            BAIT_KEY,
+        "ROD_KEY":             ROD_KEY,
+        "TARGET_CHARS":        sorted(TARGET_CHARS),
+        "SKILL_CHECK_WINDOW":  SKILL_CHECK_WINDOW,
+        "CATCH_READ_WINDOW":   CATCH_READ_WINDOW,
+        "BITE_TIMEOUT":        BITE_TIMEOUT,
+        "BAIT_KEY_DELAY":      BAIT_KEY_DELAY,
+        "BAIT_APPLY_DELAY":    BAIT_APPLY_DELAY,
+        "ROD_KEY_DELAY":       ROD_KEY_DELAY,
+        "CAST_SETTLE_TIME":    CAST_SETTLE_TIME,
+        "BETWEEN_CAST_DELAY":  BETWEEN_CAST_DELAY,
+        "SKILL_SAME_LETTER_COOLDOWN": SKILL_SAME_LETTER_COOLDOWN,
+        "CATCH_MIN_COLORED_PIXELS_DAY":   CATCH_MIN_COLORED_PIXELS_DAY,
+        "CATCH_MIN_COLORED_PIXELS_NIGHT": CATCH_MIN_COLORED_PIXELS_NIGHT,
+        "WATER_CURSOR_POS":    list(WATER_CURSOR_POS),
+    }
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print(f"[CONFIG] Saved config to {CONFIG_PATH}")
+    except Exception as e:
+        print(f"[CONFIG] Warning: could not save config ({e})")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SESSION STATS
@@ -328,6 +434,49 @@ def _count_bubble_pixels(img: Image.Image,
 
     return int(np.sum(mask))
 
+
+def _bubble_stats(img: Image.Image, brightness: float):
+    """
+    Like _count_bubble_pixels but also returns the bounding box of detected
+    bubble pixels as (min_x, min_y, max_x, max_y) relative to the cropped
+    image (after 4px inset), or None when no pixels are found.
+
+    Returns (count, bbox).
+    """
+    g_min, b_min, min_excess, _ = _get_bubble_params(brightness)
+    w, h = img.size
+    if w > 8 and h > 8:
+        img = img.crop((4, 4, w - 4, h - 4))
+    arr = np.array(img, dtype=np.int32)
+    R, G, B = arr[:,:,0], arr[:,:,1], arr[:,:,2]
+    cyan_excess = G + B - 2 * R
+
+    if brightness >= 65:
+        rain_mask = (R * 2 < G) & (R * 2 < B)
+    elif brightness >= 50:
+        rain_mask = (R * 3 < G * 2) & (R * 3 < B * 2)
+    else:
+        rain_mask = np.ones(R.shape, dtype=bool)
+    standard_mask = (G > g_min) & (B > b_min) & (cyan_excess > min_excess) & rain_mask
+
+    if brightness < 45:
+        deep_night_mask = (
+            (cyan_excess > max(1, min_excess)) &
+            ((G + B) > 30) &
+            (G > R) &
+            (B > R)
+        )
+        mask = standard_mask | deep_night_mask
+    else:
+        mask = standard_mask
+
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return (0, None)
+    bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+    count = int(np.sum(mask))
+    return (count, bbox)
+
 # ══════════════════════════════���═══════════════════════════════════════════════
 #  OVERLAY STATE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -335,7 +484,7 @@ def _count_bubble_pixels(img: Image.Image,
 _ov = {
     "bobber_count": 0, "bubble_count": 0, "bobber_state": "idle",
     "skill_brt": 0.0, "skill_letter": "", "catch_text": "",
-    "bot_state": "IDLE", "fish_count": 0,
+    "bot_state": "IDLE", "fish_count": 0, "bubble_bbox": None,
 }
 _recent_logs = []
 def ov(key, val): _ov[key] = val
@@ -378,11 +527,13 @@ def watch_bobber() -> bool:
 
         while time.time() < deadline:
             if not fishing_active:
+                ov("bubble_bbox", None)
                 return False
             bub_img = _grab_rgb(sct, BUBBLE_REGION)
             brt = _brightness(bub_img)
             g_min, b_min, cyan_excess, net_min = _get_bubble_params(brt)
-            bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
+            bub_count, bbox = _bubble_stats(bub_img, brt)
+            ov("bubble_bbox", bbox)
 
             # v5: Rolling background — update EMA only when we're NOT in a
             # bubble streak, so bubbles don't contaminate the background.
@@ -423,6 +574,7 @@ def watch_bobber() -> bool:
             time.sleep(0.016)
         else:
             log(f"  ⏱ Never saw bubbles — timeout")
+            ov("bubble_bbox", None)
             return False
 
     # ── Phase 2: watch for bubble loss ───────────────────────────────────────
@@ -434,11 +586,13 @@ def watch_bobber() -> bool:
     with mss.mss() as sct:
         while time.time() < deadline:
             if not fishing_active:
+                ov("bubble_bbox", None)
                 return False
             bub_img = _grab_rgb(sct, BUBBLE_REGION)
             brt = _brightness(bub_img)
             g_min, b_min, cyan_excess, _ = _get_bubble_params(brt)
-            bub_count = _count_bubble_pixels(bub_img, g_min, b_min, cyan_excess, brt)
+            bub_count, bbox = _bubble_stats(bub_img, brt)
+            ov("bubble_bbox", bbox)
             net_count = max(0, bub_count - int(bg_count_ema))
             red_count = _count_bobber_pixels(_grab_rgb(sct, BOBBER_REGION), brt)
             frame_n  += 1
@@ -457,6 +611,7 @@ def watch_bobber() -> bool:
                 elif time.time() - gone_since >= BUBBLE_CONFIRM_SECS:
                     log(f"  🐟 BITE! Gone for {time.time()-gone_since:.2f}s")
                     ov("bobber_state", "bite")
+                    ov("bubble_bbox", None)
                     return True
             else:
                 if gone_since is not None:
@@ -466,6 +621,7 @@ def watch_bobber() -> bool:
             time.sleep(0.016)
 
     log(f"  ⏱ No bite after {BITE_TIMEOUT}s")
+    ov("bubble_bbox", None)
     return False
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -891,6 +1047,17 @@ class DebugOverlay:
                   f"BOBBER  red={s['bobber_count']}  [{s['bobber_state']}]")
         self._box(c, BUBBLE_REGION,      "#FF00FF",
                   f"BUBBLES  bub={s.get('bubble_count',0)}")
+        bbox = s.get("bubble_bbox")
+        if bbox is not None:
+            ox = BUBBLE_REGION["left"] + 4
+            oy = BUBBLE_REGION["top"] + 4
+            bx1 = ox + bbox[0]
+            by1 = oy + bbox[1]
+            bx2 = ox + bbox[2]
+            by2 = oy + bbox[3]
+            c.create_rectangle(bx1, by1, bx2, by2, outline="#FFFF00", width=2)
+            c.create_text(bx1, by1 - 10, anchor="w", text="TRACKING", fill="#FFFF00",
+                          font=("Courier New", 8, "bold"))
         self._box(c, CATCH_REGION,       self.C["catch"],
                   f"CATCH  {s['catch_text'] or '—'}")
         hud = ["🎣 AUTOFISH v5  [F7=hide]",
@@ -940,12 +1107,326 @@ class DebugOverlay:
         except: pass
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  REGION EDITOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+_REGION_DEFAULTS = {
+    "BOBBER_REGION":     {"left": 760,  "top": 380,  "width": 220, "height": 180},
+    "BUBBLE_REGION":     {"left": 650,  "top": 300,  "width": 440, "height": 360},
+    "SKILL_CHECK_REGION":{"left": 1240, "top": 678,  "width": 80,  "height": 90},
+    "CATCH_REGION":      {"left": 1050, "top": 275,  "width": 400, "height": 19},
+}
+
+class RegionEditor:
+    _COLORS = {
+        "BOBBER_REGION":      "#FF6B35",
+        "BUBBLE_REGION":      "#FF00FF",
+        "SKILL_CHECK_REGION": "#00FF41",
+        "CATCH_REGION":       "#00D4FF",
+    }
+    _HANDLE_SIZE = 8
+
+    def __init__(self, on_close=None):
+        self._on_close = on_close
+        self._regions = {
+            name: dict(info)
+            for name, info in {
+                "BOBBER_REGION":      BOBBER_REGION,
+                "BUBBLE_REGION":      BUBBLE_REGION,
+                "SKILL_CHECK_REGION": SKILL_CHECK_REGION,
+                "CATCH_REGION":       CATCH_REGION,
+            }.items()
+        }
+        self._active   = None
+        self._drag_state = None  # (region_name, handle, off_x, off_y, orig_region)
+
+        self.root = tk.Toplevel()
+        self.root.title("Region Editor")
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        self.root.geometry(f"{sw}x{sh}+0+0")
+        self.root.overrideredirect(True)
+        self.root.wm_attributes("-topmost", True)
+        self.root.wm_attributes("-alpha", 0.55)
+
+        self.canvas = tk.Canvas(self.root, width=sw, height=sh,
+                                bg="#000000", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        # Controls frame at bottom
+        ctrl = tk.Frame(self.root, bg="#1a1a1a")
+        ctrl.place(relx=0.5, rely=1.0, anchor="s", y=-4)
+
+        tk.Button(ctrl, text="Save", bg="#2a7a2a", fg="white",
+                  command=self._on_save).pack(side="left", padx=4, pady=4)
+        tk.Button(ctrl, text="Cancel", bg="#7a2a2a", fg="white",
+                  command=self._on_cancel).pack(side="left", padx=4, pady=4)
+        tk.Button(ctrl, text="Reset Defaults", bg="#444444", fg="white",
+                  command=self._on_reset).pack(side="left", padx=4, pady=4)
+
+        self._info_var = tk.StringVar(value="Click a region to select it")
+        tk.Label(ctrl, textvariable=self._info_var, bg="#1a1a1a", fg="#FFFFFF",
+                 font=("Courier New", 9)).pack(side="left", padx=8)
+
+        self.canvas.bind("<Button-1>",        self._on_mouse_down)
+        self.canvas.bind("<B1-Motion>",        self._on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>",  self._on_mouse_up)
+        self.root.bind("<Escape>",             lambda e: self._on_cancel())
+
+        self._draw()
+
+    def _handle_positions(self, r):
+        x1, y1 = r["left"], r["top"]
+        x2, y2 = x1 + r["width"], y1 + r["height"]
+        mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+        return {
+            "tl": (x1, y1), "tr": (x2, y1), "bl": (x1, y2), "br": (x2, y2),
+            "tm": (mx, y1), "bm": (mx, y2), "lm": (x1, my), "rm": (x2, my),
+        }
+
+    def _draw(self):
+        c = self.canvas
+        c.delete("all")
+        # Semi-transparent dark background hint
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        c.create_rectangle(0, 0, sw, sh, fill="#000000", outline="")
+
+        for name, r in self._regions.items():
+            color  = self._COLORS[name]
+            active = (name == self._active)
+            width  = 3 if active else 1
+            x1, y1 = r["left"], r["top"]
+            x2, y2 = x1 + r["width"], y1 + r["height"]
+            c.create_rectangle(x1, y1, x2, y2, outline=color, width=width)
+            lw = len(name) * 7 + 6
+            c.create_rectangle(x1, y1 - 16, x1 + lw, y1,
+                                fill="#000000", outline=color, width=1)
+            c.create_text(x1 + 3, y1 - 8, anchor="w", text=name,
+                          fill=color, font=("Courier New", 8, "bold"))
+            # Draw handles
+            hs = self._HANDLE_SIZE // 2
+            for hname, (hx, hy) in self._handle_positions(r).items():
+                c.create_rectangle(hx - hs, hy - hs, hx + hs, hy + hs,
+                                   fill=color, outline="#FFFFFF", width=1)
+
+        self.root.after(80, self._draw)
+
+    def _hit_test(self, mx, my):
+        """Return (region_name, handle_or_'body') for the topmost hit, or (None, None)."""
+        hs = self._HANDLE_SIZE // 2
+        # Test handles first (active region first for priority)
+        order = ([self._active] + [n for n in self._regions if n != self._active]
+                 if self._active else list(self._regions))
+        for name in order:
+            if name is None:
+                continue
+            r = self._regions[name]
+            for hname, (hx, hy) in self._handle_positions(r).items():
+                if abs(mx - hx) <= hs and abs(my - hy) <= hs:
+                    return name, hname
+        # Test region bodies
+        for name in order:
+            if name is None:
+                continue
+            r = self._regions[name]
+            x1, y1 = r["left"], r["top"]
+            x2, y2 = x1 + r["width"], y1 + r["height"]
+            if x1 <= mx <= x2 and y1 <= my <= y2:
+                return name, "body"
+        return None, None
+
+    def _on_mouse_down(self, event):
+        name, handle = self._hit_test(event.x, event.y)
+        if name is None:
+            self._active = None
+            self._info_var.set("Click a region to select it")
+            return
+        self._active = name
+        r = self._regions[name]
+        self._drag_state = (name, handle, event.x, event.y, dict(r))
+        self._update_info(name)
+
+    def _on_mouse_drag(self, event):
+        if self._drag_state is None:
+            return
+        name, handle, sx, sy, orig = self._drag_state
+        dx = event.x - sx
+        dy = event.y - sy
+        r  = dict(orig)
+        MIN_SZ = 20
+
+        if handle == "body":
+            r["left"] = orig["left"] + dx
+            r["top"]  = orig["top"]  + dy
+        elif handle == "tl":
+            r["left"]   = orig["left"]   + dx
+            r["top"]    = orig["top"]    + dy
+            r["width"]  = max(MIN_SZ, orig["width"]  - dx)
+            r["height"] = max(MIN_SZ, orig["height"] - dy)
+        elif handle == "tr":
+            r["top"]    = orig["top"]    + dy
+            r["width"]  = max(MIN_SZ, orig["width"]  + dx)
+            r["height"] = max(MIN_SZ, orig["height"] - dy)
+        elif handle == "bl":
+            r["left"]   = orig["left"]   + dx
+            r["width"]  = max(MIN_SZ, orig["width"]  - dx)
+            r["height"] = max(MIN_SZ, orig["height"] + dy)
+        elif handle == "br":
+            r["width"]  = max(MIN_SZ, orig["width"]  + dx)
+            r["height"] = max(MIN_SZ, orig["height"] + dy)
+        elif handle == "tm":
+            r["top"]    = orig["top"]    + dy
+            r["height"] = max(MIN_SZ, orig["height"] - dy)
+        elif handle == "bm":
+            r["height"] = max(MIN_SZ, orig["height"] + dy)
+        elif handle == "lm":
+            r["left"]   = orig["left"]   + dx
+            r["width"]  = max(MIN_SZ, orig["width"]  - dx)
+        elif handle == "rm":
+            r["width"]  = max(MIN_SZ, orig["width"]  + dx)
+
+        self._regions[name] = r
+        self._update_info(name)
+
+    def _on_mouse_up(self, event):
+        self._drag_state = None
+
+    def _update_info(self, name):
+        r = self._regions[name]
+        self._info_var.set(
+            f"{name}: left={r['left']} top={r['top']} w={r['width']} h={r['height']}"
+        )
+
+    def _apply_to_globals(self):
+        global BOBBER_REGION, BUBBLE_REGION, SKILL_CHECK_REGION, CATCH_REGION
+        BOBBER_REGION      = self._regions["BOBBER_REGION"]
+        BUBBLE_REGION      = self._regions["BUBBLE_REGION"]
+        SKILL_CHECK_REGION = self._regions["SKILL_CHECK_REGION"]
+        CATCH_REGION       = self._regions["CATCH_REGION"]
+
+    def _on_save(self):
+        self._apply_to_globals()
+        save_config()
+        self._close()
+
+    def _on_cancel(self):
+        self._close()
+
+    def _on_reset(self):
+        for name, defaults in _REGION_DEFAULTS.items():
+            self._regions[name] = dict(defaults)
+        self._active = None
+        self._info_var.set("Defaults restored — press Save to apply")
+
+    def _close(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        if self._on_close:
+            self._on_close()
+
+    def run(self):
+        self.root.mainloop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONTROL PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ControlPanel:
+    def __init__(self, overlay_root: tk.Tk):
+        self._root = overlay_root
+        sw = overlay_root.winfo_screenwidth()
+
+        self.win = tk.Toplevel(overlay_root)
+        self.win.title("Autofish Control")
+        self.win.geometry(f"200x140+{sw - 210}+4")
+        self.win.wm_attributes("-topmost", True)
+        self.win.configure(bg="#1a1a1a")
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)  # prevent accidental close
+
+        # Status labels
+        self._state_var = tk.StringVar(value="IDLE")
+        self._count_var = tk.StringVar(value="Catches: 0")
+
+        tk.Label(self.win, textvariable=self._state_var,
+                 bg="#1a1a1a", fg="#00FF41",
+                 font=("Courier New", 10, "bold")).pack(pady=(6, 0))
+        tk.Label(self.win, textvariable=self._count_var,
+                 bg="#1a1a1a", fg="#FFFFFF",
+                 font=("Courier New", 9)).pack()
+
+        # Buttons
+        btn_frame = tk.Frame(self.win, bg="#1a1a1a")
+        btn_frame.pack(fill="x", padx=4, pady=4)
+
+        self._toggle_btn = tk.Button(
+            btn_frame, text="▶ Start", bg="#2a5a2a", fg="white",
+            font=("Courier New", 9), command=self._on_toggle)
+        self._toggle_btn.pack(fill="x", pady=1)
+
+        tk.Button(btn_frame, text="✏ Edit Regions", bg="#333355", fg="white",
+                  font=("Courier New", 9), command=self._on_edit_regions
+                  ).pack(fill="x", pady=1)
+
+        tk.Button(btn_frame, text="✕ Quit", bg="#5a2a2a", fg="white",
+                  font=("Courier New", 9), command=self._on_quit
+                  ).pack(fill="x", pady=1)
+
+        self._update()
+
+    def _on_toggle(self):
+        global fishing_active
+        fishing_active = not fishing_active
+        if fishing_active:
+            if not _stats["start"]:
+                _stats["start"] = time.time()
+            ov("bot_state", "FISHING")
+            log("[BOT] ▶ Fishing STARTED ✅")
+        else:
+            ov("bot_state", "STOPPED")
+            log("[BOT] ⏹ Fishing STOPPED ⛔")
+            threading.Thread(target=_save_snaps, daemon=True).start()
+            print_summary()
+
+    def _on_edit_regions(self):
+        global fishing_active
+        was_active = fishing_active
+        fishing_active = False
+
+        def restore():
+            global fishing_active
+            fishing_active = was_active
+
+        editor = RegionEditor(on_close=restore)
+        editor.root.wait_window()
+
+    def _on_quit(self):
+        global fishing_active, running
+        fishing_active = False
+        running = False
+        log("[BOT] Quitting...")
+        print_summary()
+
+    def _update(self):
+        self._state_var.set(_ov.get("bot_state", "IDLE"))
+        self._count_var.set(f"Catches: {_ov.get('fish_count', 0)}")
+        btn_text = "⏹ Stop" if fishing_active else "▶ Start"
+        self._toggle_btn.config(text=btn_text)
+        self.win.after(300, self._update)
+
+
 _overlay:     Optional[DebugOverlay] = None
 _overlay_vis: bool = True
 
 def _launch_overlay():
     global _overlay
     _overlay = DebugOverlay()
+    _control_panel = ControlPanel(_overlay.root)
     _overlay.run()
 
 def toggle_overlay():
@@ -1121,12 +1602,22 @@ def main():
 
     parser = argparse.ArgumentParser(description="Autofish Bot v5")
     parser.add_argument("--find-region", action="store_true")
+    parser.add_argument("--edit-regions", action="store_true",
+                        help="Open the region editor GUI instead of fishing")
     parser.add_argument("--debug", action="store_true",
                         help="Log bobber/bubble pixel counts every frame")
     args = parser.parse_args()
 
+    # Load config first so logged values reflect any overrides
+    load_config()
+
     if args.find_region:
         find_region_helper()
+        return
+
+    if args.edit_regions:
+        editor = RegionEditor()
+        editor.run()
         return
 
     DEBUG_VERBOSE = args.debug
