@@ -81,6 +81,7 @@ BUBBLE_GONE_THRESH    = 0.15
 BUBBLE_CONFIRM_SECS   = 1.2
 BUBBLE_MIN_BASELINE   = 2
 BUBBLE_PHASE1_REQUIRED = 8   # v5: lowered from 12 — compensated by hysteresis
+BUBBLE_HYSTERESIS_MAX  = 2   # max consecutive below-threshold frames before streak resets
 
 # ── Rolling background for bubble detection ───────────────────────────────────
 # Instead of a single stale bg snapshot, we maintain a rolling average of the
@@ -568,9 +569,9 @@ def watch_bobber() -> bool:
             else:
                 # v5: Allow up to 2 consecutive below-threshold frames within a
                 # streak before resetting.  Bubbles can flicker frame-to-frame.
-                if consecutive > 0 and drop_count < 2:
+                if consecutive > 0 and drop_count < BUBBLE_HYSTERESIS_MAX:
                     drop_count += 1
-                    log(f"  🫧 Hysteresis drop {drop_count}/2 "
+                    log(f"  🫧 Hysteresis drop {drop_count}/{BUBBLE_HYSTERESIS_MAX} "
                         f"(net={net_count} < nmin={net_min}, streak kept at {consecutive})")
                 else:
                     consecutive = 0
